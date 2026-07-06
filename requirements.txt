@@ -1,0 +1,10 @@
+# Core transcription engine (bundles ctranslate2, which is also used for
+# CUDA detection — no torch required).
+faster-whisper>=1.0.0
+
+# Hardware detection (RAM reporting).
+psutil>=5.9.0
+
+# NOTE: torch is intentionally NOT required. The script probes torch for CUDA
+# only if it happens to be installed, and works fine without it.
+# NOTE: ffmpeg is a system dependency (not a pip package) — see README.md.
