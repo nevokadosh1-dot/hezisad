@@ -1,0 +1,4 @@
+זוהי הרצאה בעברית על שוק ההון והשקעות.
+מונחים: מניות, מדדים, אג"ח, תשואה, דיבידנד, מכפיל רווח, שווי שוק, אינפלציה, ריבית, הפד, בנק ישראל, נאסד"ק, תל אביב 35, תל אביב 125.
+מדדים וקרנות: S&P 500, Nasdaq 100, QQQ, SPY, VOO, IWM, TLT.
+חברות: NVDA, Nvidia, אנבידיה, AAPL, Apple, אפל, TSLA, Tesla, טסלה, MSFT, Microsoft, מיקרוסופט, META, Meta, מטא, AMZN, Amazon, אמזון, GOOGL, Google, Alphabet, גוגל, INTC, Intel, אינטל, AMD, PLTR, Palantir, פלנטיר.
