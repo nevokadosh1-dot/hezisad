@@ -29,6 +29,7 @@ Usage:
 
 import argparse
 import datetime
+import glob
 import json
 import os
 import platform
@@ -41,13 +42,18 @@ import time
 
 # ---------------------------------------------------------------------------
 # Console setup: force UTF-8 so Hebrew prints correctly (esp. on Windows).
+# Line buffering keeps output live when a GUI wrapper reads us via a pipe.
 # ---------------------------------------------------------------------------
 for _stream in (sys.stdout, sys.stderr):
     if hasattr(_stream, "reconfigure"):
         try:
-            _stream.reconfigure(encoding="utf-8", errors="replace")
+            _stream.reconfigure(encoding="utf-8", errors="replace",
+                                line_buffering=True)
         except Exception:
-            pass
+            try:
+                _stream.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
 
 FALLBACK_MODELS = [
     "ivrit-ai/whisper-large-v3-turbo-ct2",
@@ -120,7 +126,27 @@ def format_hms(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 
+# ---------------------------------------------------------------------------
+# Machine-readable events for GUI wrappers (opt-in, CLI output unaffected)
+# ---------------------------------------------------------------------------
+EVENTS_ENV = "HEB_TRANSCRIBE_EVENTS"
+
+
+def emit_event(kind: str, **data) -> None:
+    """When the HEB_TRANSCRIBE_EVENTS=1 env var is set (by the desktop GUI),
+    print one machine-readable '@@EVENT {json}' line per event to stdout.
+    Without the env var this is a no-op, so plain CLI usage is unchanged."""
+    if os.environ.get(EVENTS_ENV) != "1":
+        return
+    try:
+        print("@@EVENT " + json.dumps({"event": kind, **data},
+                                      ensure_ascii=False), flush=True)
+    except Exception:
+        pass  # events are best-effort; never break transcription over them
+
+
 def die(message: str, code: int = 1) -> "None":
+    emit_event("error", message=message)
     print(f"\nERROR: {message}", file=sys.stderr)
     sys.exit(code)
 
@@ -295,8 +321,48 @@ def resolve_audio_filter(args):
 # ---------------------------------------------------------------------------
 # ffmpeg helpers
 # ---------------------------------------------------------------------------
+def _tool_search_dirs() -> list:
+    """Directories searched for ffmpeg/ffprobe before falling back to PATH:
+    a bundled bin/ next to the app (PyInstaller build or this script), then
+    common Windows install locations (winget, manual C:\\ffmpeg)."""
+    dirs = []
+    if getattr(sys, "frozen", False):  # PyInstaller: bundled bin/ ships in
+        meipass = getattr(sys, "_MEIPASS", None)  # _internal (onedir) or the
+        if meipass:                               # unpack dir (onefile)
+            dirs.append(os.path.join(meipass, "bin"))
+        dirs.append(os.path.join(os.path.dirname(sys.executable), "bin"))
+    dirs.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "bin"))
+    if os.name == "nt":
+        local = os.environ.get("LOCALAPPDATA")
+        if local:
+            dirs.append(os.path.join(local, "Microsoft", "WinGet", "Links"))
+            dirs.extend(glob.glob(os.path.join(
+                local, "Microsoft", "WinGet", "Packages",
+                "Gyan.FFmpeg*", "**", "bin"), recursive=True))
+        dirs.append(r"C:\ffmpeg\bin")
+    return dirs
+
+
+_TOOL_CACHE = {}
+
+
+def find_tool(name: str):
+    """Resolve ffmpeg/ffprobe to a full path (bundled/known dirs first,
+    then PATH). Returns None when the tool cannot be found anywhere."""
+    if name not in _TOOL_CACHE:
+        exe = f"{name}.exe" if os.name == "nt" else name
+        found = None
+        for d in _tool_search_dirs():
+            candidate = os.path.join(d, exe)
+            if os.path.isfile(candidate):
+                found = candidate
+                break
+        _TOOL_CACHE[name] = found or shutil.which(name)
+    return _TOOL_CACHE[name]
+
+
 def check_ffmpeg() -> None:
-    if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
+    if not find_tool("ffmpeg") or not find_tool("ffprobe"):
         print(FFMPEG_INSTALL_HELP, file=sys.stderr)
         sys.exit(1)
 
@@ -304,7 +370,7 @@ def check_ffmpeg() -> None:
 def probe_duration(media_path: str) -> float:
     """Return media duration in seconds via ffprobe."""
     cmd = [
-        "ffprobe", "-v", "error",
+        find_tool("ffprobe") or "ffprobe", "-v", "error",
         "-show_entries", "format=duration",
         "-of", "json",
         media_path,
@@ -322,7 +388,7 @@ def build_ffmpeg_extract_cmd(video_path: str, wav_path: str,
                              start: float = 0.0, duration: float = None,
                              audio_filter: str = None) -> list:
     """ffmpeg command: video -> 16 kHz mono PCM WAV, optional window/filter."""
-    cmd = ["ffmpeg", "-y"]
+    cmd = [find_tool("ffmpeg") or "ffmpeg", "-y"]
     if start and start > 0:
         cmd += ["-ss", f"{start:.3f}"]  # before -i: fast seek
     cmd += ["-i", video_path, "-vn", "-ac", "1", "-ar", "16000"]
@@ -742,6 +808,7 @@ def load_model(requested: str, device: str, compute_type: str, cpu_threads: int)
     candidates = [requested] + [m for m in FALLBACK_MODELS if m != requested]
     last_error = None
     for name in candidates:
+        emit_event("stage", stage="loading_model", model=name)
         print(f"Loading model '{name}' (device={device}, compute_type={compute_type})...")
         print("  (first run downloads the model — this can take a while)")
         try:
@@ -752,6 +819,7 @@ def load_model(requested: str, device: str, compute_type: str, cpu_threads: int)
                 cpu_threads=cpu_threads,
             )
             print(f"Model loaded: {name}\n")
+            emit_event("model_loaded", model=name)
             return model, name
         except Exception as exc:  # network errors, bad compute type, OOM, ...
             last_error = exc
@@ -813,14 +881,17 @@ def run_transcription(model, wav_path: str, settings: dict, window: dict,
         last_report = now
         elapsed = now - started
         pct = min(100.0, max(0.0, (current_ts - win_start) / win_len * 100))
-        if pct > 0.5:
-            eta_str = format_hms(elapsed * (100 - pct) / pct)
-        else:
-            eta_str = "--:--:--"
+        eta_seconds = elapsed * (100 - pct) / pct if pct > 0.5 else None
+        eta_str = format_hms(eta_seconds) if eta_seconds is not None else "--:--:--"
         line = (f"  elapsed {format_hms(elapsed)} | "
                 f"processed {format_hms(current_ts)} / {format_hms(win_end)} | "
                 f"{pct:5.1f}% | ETA {eta_str}")
         print("\r" + line, end="\n" if final else "", file=sys.stderr, flush=True)
+        emit_event("progress", current=round(current_ts, 1),
+                   window_start=round(win_start, 1),
+                   window_end=round(win_end, 1), pct=round(pct, 1),
+                   elapsed=round(elapsed, 1),
+                   eta=round(eta_seconds, 1) if eta_seconds is not None else None)
 
     # segments is a GENERATOR — transcription happens as we iterate.
     for segment in segments:
@@ -866,8 +937,9 @@ def run_self_test(args) -> int:
 
     # 1. ffmpeg / ffprobe present
     def _check_ffmpeg():
-        if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
-            raise RuntimeError("ffmpeg/ffprobe not on PATH")
+        if not find_tool("ffmpeg") or not find_tool("ffprobe"):
+            raise RuntimeError("ffmpeg/ffprobe not found (bundled bin/, "
+                               "PATH, or known install locations)")
     step("ffmpeg and ffprobe installed", _check_ffmpeg)
     if not results[-1][1]:
         print(FFMPEG_INSTALL_HELP, file=sys.stderr)
@@ -881,7 +953,7 @@ def run_self_test(args) -> int:
     # 2. Generate a small synthetic video (sine tone + black frame)
     def _gen_video():
         cmd = [
-            "ffmpeg", "-y",
+            find_tool("ffmpeg") or "ffmpeg", "-y",
             "-f", "lavfi", "-i", "sine=frequency=440:duration=6",
             "-f", "lavfi", "-i", "color=c=black:s=64x64:d=6",
             "-c:v", "libx264", "-pix_fmt", "yuv420p", "-shortest",
@@ -1238,6 +1310,7 @@ def main(argv=None) -> int:
 
     hw = resolve_hardware(args)
     print_hardware(hw)
+    emit_event("hardware", **hw)
     args.hw = hw
 
     if args.self_test:
@@ -1369,6 +1442,7 @@ def main(argv=None) -> int:
         extract_start = sample_start if args.sample_minutes is not None else resume_offset
         tmp_dir = tempfile.mkdtemp(prefix="transcribe_audio_")
         wav_path = os.path.join(tmp_dir, "audio_16k_mono.wav")
+        emit_event("stage", stage="extracting_audio")
         extract_audio(video_path, wav_path, start=extract_start,
                       duration=sample_duration, audio_filter=audio_filter)
 
@@ -1415,6 +1489,9 @@ def main(argv=None) -> int:
         }
 
         started_wall = time.monotonic()
+        emit_event("stage", stage="transcribing",
+                   window_start=round(window["start"], 1),
+                   window_end=round(window["end"], 1))
         try:
             new_records = run_transcription(model, wav_path, settings, window,
                                             jsonl_writer, partial_writer, args)
@@ -1422,6 +1499,8 @@ def main(argv=None) -> int:
             partial_writer.close()
             if jsonl_writer:
                 jsonl_writer.close()
+            emit_event("error", message="Transcription interrupted.",
+                       resumable=True)
             print(f"\n\nInterrupted. Progress saved:\n"
                   f"  segments : {segments_path if args.save_segments else '(disabled)'}\n"
                   f"  partial  : {partial_path}\n"
@@ -1432,6 +1511,8 @@ def main(argv=None) -> int:
             partial_writer.close()
             if jsonl_writer:
                 jsonl_writer.close()
+            emit_event("error", message=f"Transcription failed: {exc}",
+                       resumable=True)
             print(f"\n\nTranscription failed: {exc}\n"
                   f"Progress saved:\n"
                   f"  segments : {segments_path if args.save_segments else '(disabled)'}\n"
@@ -1455,6 +1536,7 @@ def main(argv=None) -> int:
         die("no speech was transcribed (empty result). "
             f"Partial output kept at {partial_path} for inspection.")
 
+    emit_event("stage", stage="writing_transcript")
     body = "\n\n".join(paragraphs) + "\n"
     atomic_write(output_path, header + body)
     try:  # partial file is redundant once the final transcript exists
@@ -1462,6 +1544,7 @@ def main(argv=None) -> int:
     except OSError:
         pass
 
+    emit_event("stage", stage="part_files")
     part_paths = write_part_files(output_path, paragraphs,
                                   args.split_threshold, args.part_size)
 
@@ -1495,6 +1578,14 @@ def main(argv=None) -> int:
         else:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
+    emit_event("done",
+               transcript=output_path,
+               parts=part_paths,
+               segments=segments_path if args.save_segments else None,
+               report=report_path if args.quality_report else None,
+               model=model_name,
+               chars=len(body),
+               paragraphs=len(paragraphs))
     print(f"\nDone. Model used: {model_name}")
     print(f"Transcript ({len(body):,} characters, {len(paragraphs)} paragraphs):")
     print(f"  {output_path}")

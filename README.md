@@ -1,5 +1,10 @@
 # Hebrew Lecture Transcriber
 
+> **Windows desktop app available:** prefer a GUI over the command line?
+> See [README_WINDOWS_APP.md](README_WINDOWS_APP.md) for the PySide6 desktop
+> app and how to build `HebrewTranscriber.exe`. The CLI below keeps working
+> unchanged.
+
 A local command-line tool that transcribes long Hebrew lecture videos
 (1–3 hours, e.g. stock-market lectures) into a clean, AI-readable `.txt`
 transcript.
