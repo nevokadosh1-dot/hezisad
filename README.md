@@ -286,6 +286,114 @@ Try `--normalize-audio`. If you know ffmpeg, a custom chain like
 `--audio-filter "highpass=f=80,loudnorm"` can help noisy rooms. Compare a
 `--sample-minutes 5` run with and without it before doing the full lecture.
 
+## Exporting directly to Kikar Framework Agent
+
+The transcriber can export a finished lecture straight into a Kikar Agent
+archive, producing an episode folder that the agent can ingest with no
+manual renaming:
+
+```text
+kikar-agent/data/raw_transcripts/
+  e01/                       episodes e01–e100
+    transcript.txt           the complete clean transcript (with header)
+    segments.jsonl           the raw timestamped segments (same structure)
+    metadata.json            auto-generated episode metadata
+  extras/
+    x001/                    extras x001–x999 (interviews, specials, ...)
+      transcript.txt
+      segments.jsonl
+      metadata.json
+```
+
+**Manual episode:**
+
+```powershell
+python transcribe.py "lecture.mp3" `
+  --agent-export-root "C:\Users\User\Desktop\kikar-agent\data\raw_transcripts" `
+  --episode e01 `
+  --mode long-safe `
+  --glossary finance_glossary.txt
+```
+
+**Next empty episode (scans e01–e100, skips populated folders):**
+
+```powershell
+python transcribe.py "lecture.mp3" `
+  --agent-export-root "C:\Users\User\Desktop\kikar-agent\data\raw_transcripts" `
+  --auto-next-episode `
+  --mode long-safe `
+  --glossary finance_glossary.txt
+```
+
+**Extra lecture:**
+
+```powershell
+python transcribe.py "interview.mp3" `
+  --agent-export-root "C:\Users\User\Desktop\kikar-agent\data\raw_transcripts" `
+  --extra x001 `
+  --source-type interview
+```
+
+Destination IDs are normalized (`1`, `01`, `e1`, `E01` → `e01`; `4`, `X004`
+→ `x004`). Exactly one destination flag is allowed per run: `--episode`,
+`--extra`, `--auto-next-episode`, or `--auto-next-extra`.
+
+### Metadata generation
+
+`metadata.json` is generated automatically in two layers:
+
+- **Deterministic (always, offline):** stable IDs derived from the folder
+  (`episode_id: e01`, `lecture_id: episode-e01` — never affected by title
+  changes), duration, language, model/mode, plus conservative extraction of
+  known tickers (e.g. NVDA, SPY — ordinary uppercase words are never treated
+  as tickers), and clearly-referenced people/countries/companies/macro
+  topics. A date is taken from `--lecture-date` or a recognizable date in
+  the filename — never from file modification time. Nothing is invented.
+- **Optional Claude enrichment:** if `ANTHROPIC_API_KEY` is set (and the
+  `anthropic` package installed), a low-cost Claude model fills in title,
+  topics, entities, market regime, and a 2–5 sentence factual summary. Cost
+  is controlled by sending only representative excerpts (opening, a few
+  middle windows, ending — ~8k characters), never the full 1–3 h transcript.
+  Control it with `--metadata-mode basic|auto|claude|none` (default `auto`:
+  enrich when possible, silently fall back otherwise — transcription never
+  fails because of metadata) and `--metadata-model` / the
+  `KIKAR_METADATA_MODEL` env var.
+
+Explicit values always win: `--lecture-title`, `--lecture-date YYYY-MM-DD`,
+`--speaker` (default Hezi), `--series` (defaults: Kikar Hashuk / Kikar
+Hashuk Extras), `--source-type`, `--metadata-notes`. An existing customized
+`metadata.json` in an empty episode folder is merged, not clobbered — your
+title/date/notes are preserved, and only identity/technical fields are
+refreshed.
+
+### Safety rules
+
+- **Overwrite protection:** exporting into a populated episode/extra fails
+  with a clear message. `--overwrite-agent-export` replaces it, but only
+  after backing up the old `transcript.txt` / `segments.jsonl` /
+  `metadata.json` to `e07/backups/<timestamp>/`.
+- **Samples are blocked:** `--sample-minutes` combined with agent export is
+  refused so a 5-minute sample never becomes an official episode. Override
+  with `--allow-sample-agent-export`, which marks the metadata with
+  `"status": "sample"` and the sampled window.
+- **Lifecycle:** the target gets `"status": "processing"` metadata when the
+  run starts, `"ready"` on success, and `"failed"` (with resume
+  instructions) if the run dies — populated lectures are never destroyed.
+
+### Ingesting into the agent afterwards
+
+From the `kikar-agent` project folder:
+
+```powershell
+python scripts/ingest_transcripts.py --reingest
+python scripts/build_framework_map.py
+python scripts/check_setup.py
+```
+
+Or let the transcriber run ingestion itself with `--run-agent-ingestion`
+(plus `--rebuild-framework-map` — note the framework map may call Claude and
+cost money, which is why both are off by default).
+
 ## Too slow on CPU? Use a free Google Colab GPU
 
 If your machine has no NVIDIA GPU, the easiest big speedup is running the

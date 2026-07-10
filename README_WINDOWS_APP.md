@@ -112,6 +112,43 @@ the gyan.dev builds are GPL — keep the license text alongside.
   transcript is long, a `_quality_report.txt` flagging suspicious sections,
   and the `_segments.jsonl` used by Resume.
 
+## 5b. Exporting directly to Kikar Framework Agent
+
+The **Kikar Agent Export** collapsible card (below Advanced settings) turns
+a finished transcription into an agent-ready episode folder:
+
+```text
+kikar-agent\data\raw_transcripts\e01\
+  transcript.txt
+  segments.jsonl
+  metadata.json
+```
+
+1. Tick **Export to Kikar Agent archive**.
+2. Choose the archive root (`...\kikar-agent\data\raw_transcripts`) — the
+   app remembers it between sessions (stored in per-user settings, works
+   with Hebrew usernames, spaces, other drives, and network paths).
+3. Pick **Episode** or **Extra** and type the number (`e01`, `1`, `x004` —
+   all normalized automatically), or click **Use next empty** to select the
+   first free slot. The target folder is previewed underneath, with a
+   warning if it already contains a lecture.
+4. Optionally fill lecture title / date / speaker / series / source type,
+   and pick a metadata mode (Automatic uses Claude enrichment when an
+   `ANTHROPIC_API_KEY` is configured; otherwise everything is generated
+   locally). **Preview metadata** shows the metadata skeleton.
+5. Transcribe as usual. On success the completion dialog shows
+   "Agent-ready lecture created: E01" with the three files, plus **Open
+   episode folder**, **Open metadata**, and **Copy ingestion command**
+   (which copies the `ingest_transcripts.py` / `build_framework_map.py` /
+   `check_setup.py` commands to run inside the kikar-agent project).
+
+Safety: exporting into a populated episode requires ticking the overwrite
+checkbox **and** confirming a dialog, and the old files are backed up to
+`e01\backups\<timestamp>\` first. Sample runs ask for explicit confirmation
+and are marked `"status": "sample"` so they are never mistaken for a full
+episode. The optional "run agent ingestion" checkboxes are off by default —
+framework-map rebuilding may call Claude and cost money.
+
 ## 6. Troubleshooting
 
 **"ffmpeg was not found" banner**

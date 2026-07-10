@@ -52,7 +52,8 @@ def _maybe_run_cli() -> None:
 
 _maybe_run_cli()
 
-from PySide6.QtCore import QProcess, QProcessEnvironment, Qt, QTimer, QUrl
+from PySide6.QtCore import (QProcess, QProcessEnvironment, QSettings, Qt,
+                            QTimer, QUrl)
 from PySide6.QtGui import QDesktopServices, QFont, QGuiApplication, QIcon
 from PySide6.QtWidgets import (
     QApplication, QButtonGroup, QCheckBox, QComboBox, QDoubleSpinBox,
@@ -62,6 +63,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+import agent_export
 import transcribe as engine
 
 
@@ -311,7 +313,9 @@ class MainWindow(QMainWindow):
             self.setWindowIcon(QIcon(icon_path))
 
         self.log = AppLog()
+        self.settings = QSettings("KikarTranscriber", "HebrewTranscriber")
         self.defaults = engine.parse_args([])  # engine's own CLI defaults
+        self._agent_result = None
         self.process: QProcess = None
         self._stdout_buf = ""
         self._stderr_buf = ""
@@ -594,12 +598,193 @@ class MainWindow(QMainWindow):
         grid.addWidget(self.report_check, 7, 0, 1, 2)
 
         col.addWidget(CollapsibleSection("Advanced settings", adv))
+
+        # Kikar Agent Export (collapsible) --------------------------------
+        col.addWidget(CollapsibleSection("Kikar Agent Export",
+                                         self._build_agent_panel()))
         col.addStretch(1)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setWidget(panel)
         return scroll
+
+    def _build_agent_panel(self) -> QWidget:
+        panel = QWidget()
+        grid = QGridLayout(panel)
+        grid.setContentsMargins(4, 2, 4, 4)
+        grid.setHorizontalSpacing(10)
+        grid.setVerticalSpacing(8)
+        row = 0
+
+        self.agent_check = QCheckBox("Export to Kikar Agent archive")
+        self.agent_check.toggled.connect(self._update_agent_preview)
+        grid.addWidget(self.agent_check, row, 0, 1, 4); row += 1
+
+        grid.addWidget(QLabel("Archive root:"), row, 0)
+        self.agent_root_edit = QLineEdit()
+        self.agent_root_edit.setPlaceholderText(
+            r"…\kikar-agent\data\raw_transcripts")
+        self.agent_root_edit.setText(
+            self.settings.value("agent/root", "", type=str))
+        self.agent_root_edit.textChanged.connect(self._update_agent_preview)
+        root_browse = QPushButton("Browse…")
+        root_browse.clicked.connect(self._browse_agent_root)
+        grid.addWidget(self.agent_root_edit, row, 1, 1, 2)
+        grid.addWidget(root_browse, row, 3); row += 1
+
+        grid.addWidget(QLabel("Destination:"), row, 0)
+        self.agent_kind_combo = QComboBox()
+        self.agent_kind_combo.addItems(["Episode", "Extra"])
+        self.agent_kind_combo.currentTextChanged.connect(self._update_agent_preview)
+        self.agent_id_edit = QLineEdit()
+        self.agent_id_edit.setPlaceholderText("e.g. e01 / x001")
+        self.agent_id_edit.textChanged.connect(self._update_agent_preview)
+        next_btn = QPushButton("Use next empty")
+        next_btn.setToolTip("Scan the archive and pick the first empty "
+                            "episode/extra folder")
+        next_btn.clicked.connect(self._pick_next_empty)
+        grid.addWidget(self.agent_kind_combo, row, 1)
+        grid.addWidget(self.agent_id_edit, row, 2)
+        grid.addWidget(next_btn, row, 3); row += 1
+
+        self.agent_target_label = QLabel("")
+        self.agent_target_label.setObjectName("hint")
+        self.agent_target_label.setWordWrap(True)
+        grid.addWidget(self.agent_target_label, row, 0, 1, 4); row += 1
+
+        grid.addWidget(QLabel("Lecture title:"), row, 0)
+        self.agent_title_edit = QLineEdit()
+        grid.addWidget(self.agent_title_edit, row, 1, 1, 3); row += 1
+
+        grid.addWidget(QLabel("Lecture date:"), row, 0)
+        self.agent_date_edit = QLineEdit()
+        self.agent_date_edit.setPlaceholderText("YYYY-MM-DD (optional)")
+        grid.addWidget(self.agent_date_edit, row, 1)
+        grid.addWidget(QLabel("Speaker:"), row, 2)
+        self.agent_speaker_edit = QLineEdit()
+        self.agent_speaker_edit.setPlaceholderText(agent_export.DEFAULT_SPEAKER)
+        grid.addWidget(self.agent_speaker_edit, row, 3); row += 1
+
+        grid.addWidget(QLabel("Series:"), row, 0)
+        self.agent_series_edit = QLineEdit()
+        self.agent_series_edit.setPlaceholderText("default by destination")
+        grid.addWidget(self.agent_series_edit, row, 1)
+        grid.addWidget(QLabel("Source type:"), row, 2)
+        self.agent_source_combo = QComboBox()
+        self.agent_source_combo.addItem("(auto)")
+        self.agent_source_combo.addItems(agent_export.VALID_SOURCE_TYPES)
+        grid.addWidget(self.agent_source_combo, row, 3); row += 1
+
+        grid.addWidget(QLabel("Metadata mode:"), row, 0)
+        self.agent_meta_combo = QComboBox()
+        # (label, CLI value)
+        self._meta_modes = [("Automatic (Claude when available)", "auto"),
+                            ("Basic / local only", "basic"),
+                            ("Claude enrichment (required)", "claude"),
+                            ("Minimal", "none")]
+        self.agent_meta_combo.addItems([m[0] for m in self._meta_modes])
+        grid.addWidget(self.agent_meta_combo, row, 1, 1, 2)
+        preview_btn = QPushButton("Preview metadata")
+        preview_btn.clicked.connect(self._preview_metadata)
+        grid.addWidget(preview_btn, row, 3); row += 1
+
+        self.agent_overwrite_check = QCheckBox(
+            "Overwrite populated destination (backs up existing files)")
+        grid.addWidget(self.agent_overwrite_check, row, 0, 1, 4); row += 1
+
+        self.agent_ingest_check = QCheckBox(
+            "Run agent ingestion after export (ingest_transcripts.py)")
+        grid.addWidget(self.agent_ingest_check, row, 0, 1, 4); row += 1
+        self.agent_framework_check = QCheckBox(
+            "Also rebuild framework map — may call Claude and cost money")
+        grid.addWidget(self.agent_framework_check, row, 0, 1, 4); row += 1
+        return panel
+
+    # ----------------------------------------------------- agent UI logic
+    def _browse_agent_root(self) -> None:
+        path = QFileDialog.getExistingDirectory(
+            self, "Choose kikar-agent/data/raw_transcripts")
+        if path:
+            self.agent_root_edit.setText(path)
+
+    def _agent_kind(self) -> str:
+        return "episode" if self.agent_kind_combo.currentText() == "Episode" \
+            else "extra"
+
+    def _agent_normalized_id(self):
+        """Normalized destination id from the UI, or (None, error)."""
+        raw = self.agent_id_edit.text().strip()
+        if not raw:
+            return None, "no destination id"
+        try:
+            if self._agent_kind() == "episode":
+                return agent_export.normalize_episode_id(raw), None
+            return agent_export.normalize_extra_id(raw), None
+        except agent_export.AgentExportError as exc:
+            return None, str(exc)
+
+    def _update_agent_preview(self, *_args) -> None:
+        root = self.agent_root_edit.text().strip()
+        if root:
+            self.settings.setValue("agent/root", root)
+        if not (self.agent_check.isChecked() and root):
+            self.agent_target_label.setText("")
+            return
+        ident, error = self._agent_normalized_id()
+        if not ident:
+            self.agent_target_label.setText(f"Target: ({error})")
+            return
+        folder = agent_export.target_dir(root, self._agent_kind(), ident)
+        populated = agent_export.folder_is_populated(folder)
+        note = "  ⚠ already contains a lecture" if populated else ""
+        self.agent_target_label.setText(f"Target: {folder}{note}")
+
+    def _pick_next_empty(self) -> None:
+        root = self.agent_root_edit.text().strip()
+        if not root:
+            QMessageBox.warning(self, "No archive root",
+                                "Choose the kikar-agent data/raw_transcripts "
+                                "folder first.")
+            return
+        kind = self._agent_kind()
+        ident = agent_export.find_next_empty(root, kind)
+        if not ident:
+            QMessageBox.warning(self, "Archive full",
+                                f"No empty {kind} folder found under {root}.")
+            return
+        self.agent_id_edit.setText(ident)
+        self._append_log(f"Next empty {kind}: {ident}")
+
+    def _preview_metadata(self) -> None:
+        ident, error = self._agent_normalized_id()
+        if not ident:
+            QMessageBox.warning(self, "Metadata preview",
+                                f"Fix the destination first: {error}")
+            return
+        video = self.file_edit.text().strip() or "lecture.mp3"
+        meta = agent_export.build_deterministic_metadata(
+            self._agent_kind(), ident, video, 0.0, "",
+            self.model_edit.text().strip(), self._selected_mode())
+        overrides = self._agent_cli_overrides()
+        meta = agent_export.merge_metadata(meta, None, overrides)
+        box = QMessageBox(self)
+        box.setWindowTitle("Metadata preview (deterministic fields)")
+        box.setText("This is the metadata skeleton; duration and extracted "
+                    "entities are filled after transcription, plus optional "
+                    "Claude enrichment.")
+        box.setDetailedText(json.dumps(meta, ensure_ascii=False, indent=2))
+        box.exec()
+
+    def _agent_cli_overrides(self) -> dict:
+        source = self.agent_source_combo.currentText()
+        return {
+            "lecture_title": self.agent_title_edit.text().strip() or None,
+            "lecture_date": self.agent_date_edit.text().strip() or None,
+            "speaker": self.agent_speaker_edit.text().strip() or None,
+            "series": self.agent_series_edit.text().strip() or None,
+            "source_type": None if source == "(auto)" else source,
+        }
 
     def _build_progress_panel(self) -> QWidget:
         panel = QWidget()
@@ -797,6 +982,35 @@ class MainWindow(QMainWindow):
             args += ["--no-save-segments"]
         if not self.report_check.isChecked():
             args += ["--no-quality-report"]
+
+        # Kikar Agent export (mirrors the CLI flags exactly)
+        if self.agent_check.isChecked():
+            args += ["--agent-export-root", self.agent_root_edit.text().strip()]
+            ident, _ = self._agent_normalized_id()
+            if ident:
+                args += ["--episode" if self._agent_kind() == "episode"
+                         else "--extra", ident]
+            for flag, value in [
+                    ("--lecture-title", self.agent_title_edit.text().strip()),
+                    ("--lecture-date", self.agent_date_edit.text().strip()),
+                    ("--speaker", self.agent_speaker_edit.text().strip()),
+                    ("--series", self.agent_series_edit.text().strip())]:
+                if value:
+                    args += [flag, value]
+            source = self.agent_source_combo.currentText()
+            if source != "(auto)":
+                args += ["--source-type", source]
+            mode_value = self._meta_modes[self.agent_meta_combo.currentIndex()][1]
+            if mode_value != "auto":
+                args += ["--metadata-mode", mode_value]
+            if self.agent_overwrite_check.isChecked():
+                args += ["--overwrite-agent-export"]
+            if sample:
+                args += ["--allow-sample-agent-export"]
+            if self.agent_ingest_check.isChecked():
+                args += ["--run-agent-ingestion"]
+                if self.agent_framework_check.isChecked():
+                    args += ["--rebuild-framework-map"]
         return args
 
     def _engine_command(self, cli_args: list) -> (str, list):
@@ -826,6 +1040,48 @@ class MainWindow(QMainWindow):
             return
         if not sample and self.sample_check.isChecked() and not resume:
             sample = True  # the checkbox turns the main button into sample mode
+
+        # Kikar Agent export validation (same rules as the CLI).
+        if self.agent_check.isChecked():
+            root = self.agent_root_edit.text().strip()
+            if not root:
+                QMessageBox.warning(self, "Agent export",
+                                    "Choose the Kikar Agent archive root "
+                                    "(data/raw_transcripts) first.")
+                return
+            ident, error = self._agent_normalized_id()
+            if not ident:
+                QMessageBox.warning(self, "Agent export",
+                                    f"Fix the destination: {error}\n"
+                                    "(or click 'Use next empty')")
+                return
+            if sample:
+                answer = QMessageBox.question(
+                    self, "Export a sample?",
+                    "Sample transcription is not exported as a complete "
+                    "Kikar episode.\n\nExport it anyway, marked with "
+                    "status 'sample'?",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+                if answer != QMessageBox.Yes:
+                    return
+            folder = agent_export.target_dir(root, self._agent_kind(), ident)
+            if agent_export.folder_is_populated(folder):
+                if not self.agent_overwrite_check.isChecked():
+                    QMessageBox.warning(
+                        self, "Destination not empty",
+                        f"{ident.upper()} already contains a lecture.\n\n"
+                        "Tick the overwrite checkbox only if you "
+                        "intentionally want to replace it, or click "
+                        "'Use next empty'.")
+                    return
+                answer = QMessageBox.question(
+                    self, "Overwrite lecture?",
+                    f"{ident.upper()} already contains a lecture.\n\n"
+                    "Replace it? The existing files will be backed up to "
+                    "a 'backups' folder first.",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+                if answer != QMessageBox.Yes:
+                    return
 
         # CPU heads-up before committing to a full multi-hour run.
         if not sample and not resume and not engine.detect_cuda() \
@@ -874,6 +1130,7 @@ class MainWindow(QMainWindow):
         self._stopping = False
         self._done_info = None
         self._error_message = None
+        self._agent_result = None
         self._run_started = time.monotonic()
         self._set_running_state()
         self._set_stage("checking")
@@ -948,6 +1205,12 @@ class MainWindow(QMainWindow):
             self.log.write(f"Engine hardware: {event}")
         elif kind == "done":
             self._done_info = event
+        elif kind == "agent_export":
+            self._agent_result = event
+            self.log.write(f"Agent export: {event.get('display_id')} -> "
+                           f"{event.get('folder')} "
+                           f"(status {event.get('status')}, "
+                           f"AI-enriched {event.get('ai_enriched')})")
         elif kind == "error":
             self._error_message = event.get("message")
 
@@ -1002,24 +1265,48 @@ class MainWindow(QMainWindow):
             self.open_transcript_btn.setEnabled(True)
             self.open_folder_btn.setEnabled(True)
 
+            agent = self._agent_result
             box = QMessageBox(self)
             box.setWindowTitle("Transcription complete")
             box.setIcon(QMessageBox.Information)
-            box.setText(f"Done in {elapsed}  ·  {done.get('chars', 0):,} "
-                        f"characters, {done.get('paragraphs', 0)} paragraphs.")
-            box.setInformativeText("\n".join(f"{label}:  {path}"
-                                             for label, path in files if path))
+            text = (f"Done in {elapsed}  ·  {done.get('chars', 0):,} "
+                    f"characters, {done.get('paragraphs', 0)} paragraphs.")
+            info = "\n".join(f"{label}:  {path}" for label, path in files if path)
+            if agent:
+                text = (f"Agent-ready lecture created:\n"
+                        f"{agent.get('display_id')}\n\n" + text)
+                info = ("Files:\n✓ transcript.txt\n✓ segments.jsonl\n"
+                        f"✓ metadata.json\n\nEpisode folder: "
+                        f"{agent.get('folder')}\n\n" + info)
+            box.setText(text)
+            box.setInformativeText(info)
             open_btn = box.addButton("Open transcript", QMessageBox.AcceptRole)
             folder_btn = box.addButton("Open folder", QMessageBox.ActionRole)
             copy_btn = box.addButton("Copy path", QMessageBox.ActionRole)
+            episode_btn = meta_btn = ingest_btn = None
+            if agent:
+                episode_btn = box.addButton("Open episode folder",
+                                            QMessageBox.ActionRole)
+                meta_btn = box.addButton("Open metadata", QMessageBox.ActionRole)
+                ingest_btn = box.addButton("Copy ingestion command",
+                                           QMessageBox.ActionRole)
             box.addButton(QMessageBox.Close)
             box.exec()
-            if box.clickedButton() is open_btn:
+            clicked = box.clickedButton()
+            if clicked is open_btn:
                 self._open_transcript()
-            elif box.clickedButton() is folder_btn:
+            elif clicked is folder_btn:
                 self._open_output_folder()
-            elif box.clickedButton() is copy_btn:
+            elif clicked is copy_btn:
                 QGuiApplication.clipboard().setText(self._last_transcript or "")
+            elif agent and clicked is episode_btn:
+                open_in_file_manager(agent.get("folder"))
+            elif agent and clicked is meta_btn:
+                open_in_file_manager((agent.get("files") or {}).get("metadata"))
+            elif agent and clicked is ingest_btn:
+                QGuiApplication.clipboard().setText(
+                    agent_export.INGESTION_COMMANDS)
+                self._append_log("Ingestion commands copied to clipboard.")
             return
 
         # Failure path: keep all partial/JSONL files, explain clearly.
@@ -1134,6 +1421,30 @@ def smoke_test() -> int:
     assert "--sample-minutes" not in args
     program, argv = win._engine_command(["x.mp4"])
     assert argv[-1] == "x.mp4"
+
+    # Kikar Agent export card: GUI arguments must match the CLI flags.
+    win.agent_check.setChecked(True)
+    win.agent_root_edit.setText("/tmp/archive/data/raw_transcripts")
+    win.agent_kind_combo.setCurrentText("Episode")
+    win.agent_id_edit.setText("E1")  # normalizes to e01
+    win.agent_title_edit.setText("כותרת בדיקה")
+    win.agent_date_edit.setText("2026-07-09")
+    win.agent_overwrite_check.setChecked(True)
+    args = win.build_cli_args(sample=False, resume=False)
+    assert "--agent-export-root" in args and "--episode" in args
+    assert args[args.index("--episode") + 1] == "e01"
+    assert "--lecture-title" in args and "--lecture-date" in args
+    assert "--overwrite-agent-export" in args
+    assert "--allow-sample-agent-export" not in args
+    win.agent_kind_combo.setCurrentText("Extra")
+    win.agent_id_edit.setText("4")
+    args = win.build_cli_args(sample=True, resume=False)
+    assert args[args.index("--extra") + 1] == "x004"
+    assert "--allow-sample-agent-export" in args
+    win.agent_check.setChecked(False)
+    args = win.build_cli_args(sample=False, resume=False)
+    assert "--agent-export-root" not in args
+
     win.close()
     del app
     print("GUI smoke test OK")

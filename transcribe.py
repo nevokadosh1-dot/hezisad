@@ -1282,6 +1282,59 @@ def parse_args(argv=None):
     parser.add_argument("--part-size", type=int, default=40000,
                         help="target size (characters) of each part file")
 
+    # Kikar Agent export (optional workflow; normal transcription unchanged)
+    agent = parser.add_argument_group("Kikar Agent export")
+    agent.add_argument("--agent-export-root", default=None, metavar="PATH",
+                       help="kikar-agent/data/raw_transcripts folder; when "
+                            "set, also export transcript.txt / segments.jsonl"
+                            " / metadata.json into an episode/extra folder")
+    dest = agent.add_mutually_exclusive_group()
+    dest.add_argument("--episode", default=None, metavar="ID",
+                      help="target episode (1 / 01 / e1 / E01 -> e01)")
+    dest.add_argument("--extra", default=None, metavar="ID",
+                      help="target extra (4 / 004 / x4 / X004 -> x004)")
+    dest.add_argument("--auto-next-episode", action="store_true",
+                      help="export into the first empty episode folder")
+    dest.add_argument("--auto-next-extra", action="store_true",
+                      help="export into the first empty extras folder")
+    agent.add_argument("--overwrite-agent-export", action="store_true",
+                       help="replace a populated episode/extra (existing "
+                            "files are backed up first)")
+    agent.add_argument("--allow-sample-agent-export", action="store_true",
+                       help="allow exporting a --sample-minutes run "
+                            "(marked with status 'sample')")
+    agent.add_argument("--lecture-title", default=None, metavar="TEXT",
+                       help="metadata: lecture title")
+    agent.add_argument("--lecture-date", default=None, metavar="YYYY-MM-DD",
+                       help="metadata: lecture date")
+    agent.add_argument("--speaker", default=None, metavar="TEXT",
+                       help="metadata: speaker (default: Hezi)")
+    agent.add_argument("--series", default=None, metavar="TEXT",
+                       help="metadata: series name")
+    agent.add_argument("--source-type", default=None,
+                       choices=["episode", "special_lecture", "interview",
+                                "guest_appearance", "live_session",
+                                "short_update", "course_lesson", "podcast",
+                                "other"],
+                       help="metadata: source type (extras default: other)")
+    agent.add_argument("--metadata-notes", default=None, metavar="TEXT",
+                       help="metadata: free-text notes")
+    agent.add_argument("--metadata-mode", default="auto",
+                       choices=["basic", "auto", "claude", "none"],
+                       help="basic=deterministic only; auto=Claude when "
+                            "available else deterministic; claude=require "
+                            "enrichment; none=minimal metadata")
+    agent.add_argument("--metadata-model", default=None, metavar="MODEL",
+                       help="Claude model for enrichment (also via the "
+                            "KIKAR_METADATA_MODEL env var)")
+    agent.add_argument("--run-agent-ingestion", action="store_true",
+                       help="after export, run scripts/ingest_transcripts.py "
+                            "--reingest in the agent project (off by default)")
+    agent.add_argument("--rebuild-framework-map", action="store_true",
+                       help="with --run-agent-ingestion: also run "
+                            "scripts/build_framework_map.py (may call Claude "
+                            "and cost money)")
+
     parser.add_argument("--self-test", action="store_true",
                         help="run an end-to-end pipeline self-test and exit")
     parser.add_argument("--skip-model", action="store_true",
@@ -1360,6 +1413,50 @@ def main(argv=None) -> int:
         if args.resume:
             die("--resume cannot be combined with --sample-minutes "
                 "(samples are one-shot quality tests)")
+
+    # --- Kikar Agent export planning (optional workflow) ---------------------
+    agent_plan = None
+    agent_cli_overrides = {}
+    if any([args.episode, args.extra, args.auto_next_episode,
+            args.auto_next_extra]) and not args.agent_export_root:
+        die("--episode/--extra/--auto-next-* require --agent-export-root")
+    if args.agent_export_root:
+        import agent_export
+
+        if args.sample_minutes is not None and not args.allow_sample_agent_export:
+            die("Sample transcription is not exported as a complete Kikar "
+                "episode.\nUse --allow-sample-agent-export if this is "
+                "intentional.")
+        try:
+            agent_plan = agent_export.resolve_plan(
+                args.agent_export_root,
+                episode=args.episode, extra=args.extra,
+                auto_next_episode=args.auto_next_episode,
+                auto_next_extra=args.auto_next_extra,
+                overwrite=args.overwrite_agent_export)
+        except agent_export.AgentExportError as exc:
+            die(str(exc))
+        agent_cli_overrides = {
+            "lecture_title": args.lecture_title,
+            "lecture_date": args.lecture_date,
+            "speaker": args.speaker,
+            "series": args.series,
+            "source_type": args.source_type,
+            "notes": args.metadata_notes,
+        }
+        if not args.save_segments:
+            print("NOTE: agent export requires the segments JSONL; "
+                  "enabling --save-segments.", file=sys.stderr)
+            args.save_segments = True
+        print(f"Agent export: {agent_plan.display_id} -> {agent_plan.folder}")
+        print(f"  archive root : {agent_plan.root}")
+        print(f"  target empty : {not agent_plan.was_populated}"
+              + (f" (existing lecture will be backed up)"
+                 if agent_plan.was_populated else ""))
+        print(f"  metadata mode: {args.metadata_mode}")
+        agent_export.write_processing_metadata(
+            agent_plan, os.path.basename(video_path), args.mode,
+            source_type=args.source_type, cli_overrides=agent_cli_overrides)
 
     # --- Resolve output paths ----------------------------------------------
     if args.output:
@@ -1501,6 +1598,9 @@ def main(argv=None) -> int:
                 jsonl_writer.close()
             emit_event("error", message="Transcription interrupted.",
                        resumable=True)
+            if agent_plan:
+                import agent_export
+                agent_export.mark_failed(agent_plan)
             print(f"\n\nInterrupted. Progress saved:\n"
                   f"  segments : {segments_path if args.save_segments else '(disabled)'}\n"
                   f"  partial  : {partial_path}\n"
@@ -1513,6 +1613,9 @@ def main(argv=None) -> int:
                 jsonl_writer.close()
             emit_event("error", message=f"Transcription failed: {exc}",
                        resumable=True)
+            if agent_plan:
+                import agent_export
+                agent_export.mark_failed(agent_plan)
             print(f"\n\nTranscription failed: {exc}\n"
                   f"Progress saved:\n"
                   f"  segments : {segments_path if args.save_segments else '(disabled)'}\n"
@@ -1533,6 +1636,9 @@ def main(argv=None) -> int:
     paragraphs = build_paragraphs(all_records, args.max_paragraph_chars,
                                   args.pause_threshold)
     if not paragraphs:
+        if agent_plan:
+            import agent_export
+            agent_export.mark_failed(agent_plan)
         die("no speech was transcribed (empty result). "
             f"Partial output kept at {partial_path} for inspection.")
 
@@ -1570,6 +1676,61 @@ def main(argv=None) -> int:
             "rtf": rtf,
         }
         atomic_write(report_path, build_quality_report(meta, all_records))
+
+    # --- Kikar Agent export ----------------------------------------------------
+    agent_result = None
+    if agent_plan:
+        import agent_export
+
+        sample_info = None
+        if args.sample_minutes is not None:
+            sample_info = {"start_minute": args.sample_start_minute,
+                           "duration_minutes": args.sample_minutes}
+        try:
+            agent_result = agent_export.finalize_export(
+                agent_plan,
+                transcript_content=header + body,
+                segment_records=all_records,
+                source_file=os.path.basename(video_path),
+                duration_seconds=(sample_duration
+                                  if args.sample_minutes is not None
+                                  else duration_s),
+                transcript_body=body,
+                model_name=model_name,
+                mode=args.mode,
+                metadata_mode=args.metadata_mode,
+                metadata_model=args.metadata_model,
+                cli_overrides=agent_cli_overrides,
+                sample_info=sample_info)
+        except agent_export.AgentExportError as exc:
+            agent_export.mark_failed(agent_plan)
+            die(f"agent export failed: {exc}")
+        print(f"\nAgent-ready lecture created: {agent_result['display_id']}")
+        for name, path in agent_result["files"].items():
+            size = agent_result["sizes"][os.path.basename(path)]
+            print(f"  ✓ {os.path.basename(path)}  ({size:,} bytes)")
+        print(f"  folder : {agent_result['folder']}")
+        print(f"  status : {agent_result['status']}  |  AI-enriched: "
+              f"{agent_result['ai_enriched']}"
+              + (f"  |  model: {agent_result['metadata_model']}"
+                 if agent_result["ai_enriched"] else ""))
+        if agent_result["backup_dir"]:
+            print(f"  backup : {agent_result['backup_dir']}")
+        print("  Next step (from the kikar-agent project folder):\n    "
+              + agent_export.INGESTION_COMMANDS.replace("\n", "\n    "))
+        emit_event("agent_export",
+                   folder=agent_result["folder"],
+                   id=agent_result["id"],
+                   display_id=agent_result["display_id"],
+                   destination_kind=agent_result["kind"],
+                   files=agent_result["files"],
+                   status=agent_result["status"],
+                   ai_enriched=agent_result["ai_enriched"],
+                   backup_dir=agent_result["backup_dir"])
+        if args.run_agent_ingestion:
+            agent_export.run_ingestion(
+                args.agent_export_root,
+                rebuild_framework_map=args.rebuild_framework_map)
 
     # --- Cleanup temp audio ---------------------------------------------------
     if tmp_dir:
